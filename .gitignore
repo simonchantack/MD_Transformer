@@ -1,0 +1,14 @@
+# Virtual environments
+venv/
+venv2/
+.venv/
+env/
+
+# Settings
+.vscode/
+
+# Model checkpoints
+*.pt
+*.pth
+*.keras
+*.pkl
