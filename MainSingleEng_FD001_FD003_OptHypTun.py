@@ -1,4 +1,9 @@
 # %%
+# Date: Dec-15-2025
+# Author: Simon Chan Tack
+# File: MainSingleEng_FD001_FD003_OptHypTun.py
+# Code execute entire pipeline of the Multi-Dimension Transformer architecture
+# Preforms Optimal Hyperparameter tuning on engine FD002 and FD004 dataset
 import os
 import math
 import time
@@ -20,10 +25,6 @@ from tensorflow.keras.layers import Dense, LSTM
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error as mse
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
-
-
-
-
 
 
 import torch
@@ -336,54 +337,6 @@ class supDataset(Dataset):
     # return torch.tensor(X, dtype=torch.float),  torch.tensor(y, dtype=torch.int64)
     return torch.tensor(X, dtype=torch.float), y
 
- 
-
-# def padding_mask(lengths, max_len=None):
-#     """
-#     Used to mask padded positions: creates a (batch_size, max_len) boolean mask from a tensor of sequence lengths,
-#     where 1 means the values at time step (t) are used to compute attention weights
-#     """
-#     batch_size = lengths.numel()
-#     max_len = max_len or lengths.max_val()  # trick works because of overloading of 'or' operator for non-boolean types
-#     return (torch.arange(0, max_len, device=lengths.device)
-#             .type_as(lengths)
-#             .repeat(batch_size, 1)
-#             .lt(lengths.unsqueeze(1)))
-
-# def collate_superv(data, max_len=max_len):
-#     """Build mini-batch tensors from a list of (X, y) tuples.
-#     Args:
-#         data: len(batch_size) list of tuples (X, y).
-#             - X: torch tensor of shape (seq_length, feat_dim); variable seq_length.
-#             - y: torch tensor of shape (1);
-#         max_len: global fixed sequence length. Used for architectures requiring fixed length input,
-#             where the batch length cannot vary dynamically. Longer sequences are clipped, shorter are padded with 0s
-#     Returns:
-#         X: (batch_size, padded_length, feat_dim) torch tensor of masked features (input)
-#         y: (batch_size,1)
-#         padding_masks: (batch_size, padded_length) boolean tensor, 1 means keep vector at this position, 0 ignore (padding)
-#     """
-
-#     batch_size = len(data)
-#     features, targets = zip(*data)
-
-#     # Stack and pad features and masks (convert 2D to 3D tensors, i.e. add batch dimension)
-#     lengths = [X.shape[0] for X in features]  # original sequence length for each time series
-#     if max_len is None:
-#         max_len = max(lengths)
-
-#     X = torch.zeros(batch_size, max_len, features[0].shape[-1])  # (batch_size, padded_length, feat_dim)
-
-#     for i in range(batch_size):
-#         end = min(lengths[i], max_len)
-#         X[i, :end, :] = features[i][:end, :]
-
-#     padding_masks = padding_mask(torch.tensor(lengths, dtype=torch.int16), max_len=max_len)  # (batch_size, padded_length) boolean tensor, "1" means keep
-#     # X = x.clone().detach().requires_grad_(True)
-#     X = X.clone().detach().requires_grad_(True).type('torch.FloatTensor')
-#     targets = torch.tensor(targets, dtype=torch.float).reshape(-1,1)
-#     return X, targets, padding_masks
-
 
 
 # %%
@@ -404,20 +357,6 @@ import torch.nn as nn
 from dataclasses import dataclass, asdict
 from typing import List, Optional, Tuple, Dict
 from torch.utils.data import Dataset, DataLoader
-
-# import os
-# import math
-# import time
-# from dataclasses import dataclass, asdict
-# from typing import List, Optional, Tuple, Dict
-
-# import numpy as np
-# import pandas as pd
-# import torch
-# import torch.nn as nn
-# from torch.utils.data import Dataset, DataLoader
-
-
 
 
 # ---------------------------------
@@ -647,57 +586,6 @@ class SensorChannelTransformerEncoder(nn.Module):
         return enc   # (B, L*N_patch, d_model)
 
 
-# # --------------------------
-# # Fusion Head
-# # --------------------------
-# class FusionHead(nn.Module):
-#     def __init__(self, d_model_t: int, d_model_c: int, head_hidden: Optional[int] = None, dropout: float = 0.1, pooling="mean"):
-#         super(FusionHead, self).__init__()        
-        
-#         # project to common width if needed
-#         self.proj_t = nn.Identity() if d_model_t == d_model_c else nn.Linear(d_model_t, d_model_c)
-#         self.d_model = d_model_c
-
-#         self.norm = nn.LayerNorm(self.d_model)
-#         assert pooling in ["mean", "cls"]
-#         self.pooling = pooling
-
-#         # MLP pipeline
-#         self.mlp = nn.Sequential(
-#             nn.Linear(self.d_model, head_hidden),
-#             nn.GELU(),
-#             nn.Dropout(dropout),
-#             nn.Linear(head_hidden, 1)  # final regression/classification output
-#         )
-        
-
-#     def forward(self, temporal_out, channel_out):
-#         """
-#         temporal_out: (B, N, d_model_t)  # time tokens (N = num patches)
-#         channel_out : (B, C, d_model_c)  # sensor tokens
-
-#         return: (B, 1)
-#         """
-        
-#         t = self.proj_t(temporal_out)     # (B, N, d_model)
-#         c = channel_out                   # (B, C, d_model)
-
-#         # DAST-style concat across sequence dim
-#         p = torch.cat([t, c], dim=1)      # (B, N+C, d_model)
-#         p = self.norm(p)
-
-#         #  # --- BatchNorm requires permute ---
-#         # p = p.permute(0, 2, 1)         # (B, d_model, N+C)
-#         # p = self.norm(p)               # BN across feature dimension
-#         # p = p.permute(0, 2, 1)         # back to (B, N+C, d_model)
-
-#         # Pool to global representation
-#         if self.pooling == "mean":
-#             pooled = p.mean(dim=1)        # (B, d_model)
-#         else:
-#             pooled = p[:, 0, :]           # CLS-style
-
-#         return self.mlp(pooled)
 
 # -------------------------------------
 # Fusion with Batch Normalization
@@ -1189,7 +1077,7 @@ study = optuna.create_study(
 
 study.optimize(objective, n_trials=25, timeout=None)  # run for 3 hours max  , timeout=60*60*3
 
-print("✅ Best trial:")
+print("Best trial:")
 best_trial = study.best_trial
 print(f"  Value (RMSE): {best_trial.value:.4f}")
 print("  Params: ")
