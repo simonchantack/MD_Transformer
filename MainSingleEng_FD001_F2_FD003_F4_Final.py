@@ -80,7 +80,7 @@ Sensor_dictionary
 # Load Test Data base on engine type. Engine typ can be FD001, FD002, FD003, of FD004
 # this is RUL of each engine on test set. 100 row 
 import pandas as pd
-eng_type = 'FD002'   # Set the engine type here..
+eng_type = 'FD001'   # Set the engine type here..
 data_test = pd.read_csv('Data/test_' + eng_type +'.txt' , sep = ' ' , 
                        header = None, names = column_names , index_col = False)
 
