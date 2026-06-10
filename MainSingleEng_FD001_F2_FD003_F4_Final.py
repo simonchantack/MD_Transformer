@@ -1218,8 +1218,8 @@ best_rmse = 20  # Set RMSE high as a starting reference
 
 # Use fixed random states or generate a list of 20 random integers between 0 and 200
 rand_cnt = 1
-random_state_lst = [341] #[341,333, 250, 42,378, 350] 
-# random_state_lst = [random.randint(0, 350) for _ in range(20)] 
+# random_state_lst = [341] #[341, 333, 250, 42,378, 350] 
+random_state_lst = [random.randint(0, 350) for _ in range(20)] 
 for randstate in random_state_lst:    
     X_train, X_val , y_train, y_val  = train_test_split(X_train_sw, y_train_sw, test_size=0.2 , random_state=randstate)
 

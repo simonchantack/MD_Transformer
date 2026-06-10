@@ -62,7 +62,7 @@
 
   HOW TO USE
   ----------
-  1. Run your existing notebook/script up to (and including) the definitions of:
+  1. Run the existing notebook/script up to (and including) the definitions of:
          X_train_sw, y_train_sw   (from create_training_sequences_sw)
          X_testf, y_test          (from create_testing_sequences_sw)
          features, eng_type, device
@@ -1223,13 +1223,12 @@ def run_all_scenarios(
  
         ensemble_seeds  = [42, 137, 271]
         ensemble_models = []
-        per_seed_rows   = []          # NEW: capture per-seed test metrics
-
+ 
         for seed in ensemble_seeds:
             print(f"\n  [Ensemble seed={seed}]")
             torch.manual_seed(seed)
             np.random.seed(seed)
-
+ 
             Xtr_e, Xvl_e, ytr_e, yvl_e = train_test_split(
                 Xsw_e, ysw_e, test_size=0.2, random_state=seed
             )
@@ -1243,7 +1242,7 @@ def run_all_scenarios(
             )
             ecfg.C = Ce
             ecfg.L = Le
-
+ 
             em, _, _ = fit_improved(
                 tr_e, vl_e, features, ecfg, device,
                 loss_fn=copy.deepcopy(bloss),
@@ -1253,22 +1252,7 @@ def run_all_scenarios(
                 verbose=verbose,
             )
             ensemble_models.append(em)
-            # NEW: per-seed test metrics for paired-t-test analysis
-            _, _m, _yt, _yp = evaluate_improved(
-                em, te_loader, device, nn.MSELoss())
-            per_seed_rows.append({
-                "variant": "ITT", "seed": seed, "eng_type": eng_type,
-                "RMSE": _m["RMSE"], "MAE": _m["MAE"],
-                "R2": _m["R2"],
-                "NASA": float(score_nasa(_yp - _yt)),
-            })
-
-        # NEW: persist per-seed metrics to CSV (one file per variant per engine)
-        import os as _os, pandas as _pd
-        _os.makedirs("per_seed_metrics", exist_ok=True)
-        _pd.DataFrame(per_seed_rows).to_csv(
-            f"per_seed_metrics/ITT_{eng_type}.csv", index=False)
-
+ 
         ens_pred, ens_true, ens_mets = ensemble_predict(
             ensemble_models, te_loader, device
         )
@@ -1367,4 +1351,681 @@ def run_all_scenarios(
 #       verbose                      = True,
 #   )
 #
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# =============================================================================
+#  SECTION 8 — SENSITIVITY & ROBUSTNESS EXPERIMENTS  (NEW)
+# =============================================================================
+"""
+This section implements four sensitivity / robustness analyses that
+``access_R1.tex`` (\\S~``Robustness and Sensitivity Analysis'') claimed but
+that the original ``improve_transformer.py`` does not perform. Running the
+functions below on top of the existing pipeline produces the genuine data
+those four tables should contain:
+
+  1. Inference-time additive sensor noise sweep     -> tab:noise-sensitivity
+  2. Training-set sub-sampling                      -> tab:trainsize-sensitivity
+  3. Dropout-rate sweep                             -> tab:dropout-sensitivity
+  4. Cross-engine generalization                    -> tab:cross-engine
+
+Public API:
+
+    from improve_transformer_sensitivity_analysis import (
+        run_inference_noise_sweep,
+        run_training_size_sweep,
+        run_dropout_sweep,
+        run_cross_engine_evaluation,
+        run_all_sensitivity_experiments,
+    )
+
+The implementations reuse the existing infrastructure of this file
+(``TrainConfig``, ``fit_improved``, ``ensemble_predict``,
+``run_all_scenarios``, ``score_nasa``, ...).
+"""
+
+
+# -------------------------------------------------------------------------
+# Helper: build a test loader from an (X_testf, y) pair using the same
+# conventions as run_all_scenarios().
+# -------------------------------------------------------------------------
+def _build_sensitivity_test_loader(X_testf_or_arr, y_test, batch_size: int = 64):
+    """
+    Return a DataLoader that yields ``(xb, yb)`` batches in the layout
+    ``fit_improved`` / ``evaluate_improved`` expects (xb shape = (B, C, L)).
+
+    Accepts either ``(N, L, C)`` (the raw return shape of
+    ``create_testing_sequences_sw``) or already-transposed ``(N, C, L)``.
+    The heuristic: if dim-1 >= dim-2, assume ``(N, L, C)`` and transpose.
+    """
+    arr = np.asarray(X_testf_or_arr)
+    if arr.ndim != 3:
+        raise ValueError(f"Expected 3-D X_testf, got shape {arr.shape}")
+    if arr.shape[1] >= arr.shape[2]:
+        Xt = arr.transpose(0, 2, 1)
+    else:
+        Xt = arr
+
+    class _SensDS(Dataset):
+        def __init__(self, X, y):
+            self.X = X.astype(np.float32)
+            self.y = np.asarray(y).astype(np.float32).reshape(-1)
+        def __len__(self):
+            return len(self.X)
+        def __getitem__(self, i):
+            return torch.from_numpy(self.X[i]), torch.tensor(self.y[i])
+
+    return DataLoader(_SensDS(Xt, y_test), batch_size=batch_size, shuffle=False)
+
+
+# -------------------------------------------------------------------------
+# Experiment 1: Inference-time noise sweep
+# -------------------------------------------------------------------------
+@torch.no_grad()
+def evaluate_ensemble_with_noise(
+    models, X_testf, y_test, sigma: float, device,
+    n_noise_seeds: int = 20, batch_size: int = 64, base_seed: int = 0,
+):
+    """
+    For a fixed sigma, generate ``n_noise_seeds`` noisy copies of ``X_testf``
+    (each element perturbed by i.i.d. ``N(0, sigma**2)``) and evaluate the
+    ensemble predictions on each. Returns
+    ``{metric_name: (mean, std)}`` over the noise realisations.
+
+    The trained ``models`` are NOT re-trained -- only the test-time inputs
+    change. Because all features were StandardScaler-normalised before
+    windowing, sigma is in units of one feature std, i.e.\\ sigma=0.05 means
+    ~5 % perturbation relative to the per-feature std.
+    """
+    arr = np.asarray(X_testf).astype(np.float32)
+    rmses, maes, r2s, nasas = [], [], [], []
+
+    for s in range(n_noise_seeds):
+        rng = np.random.default_rng(base_seed + s)
+        if sigma > 0.0:
+            X_noisy = arr + rng.standard_normal(arr.shape).astype(np.float32) * sigma
+        else:
+            X_noisy = arr
+        loader = _build_sensitivity_test_loader(X_noisy, y_test, batch_size)
+        ypred, ytrue, mets = ensemble_predict(models, loader, device)
+        rmses.append(mets["RMSE"])
+        maes.append(mets["MAE"])
+        r2s.append(mets["R2"])
+        nasas.append(score_nasa(ypred - ytrue))
+
+    def _ms(lst):
+        return (float(np.mean(lst)), float(np.std(lst)))
+    return {
+        "RMSE": _ms(rmses), "MAE": _ms(maes),
+        "R2":   _ms(r2s),   "NASA": _ms(nasas),
+    }
+
+
+def run_inference_noise_sweep(
+    ensemble_models, X_testf, y_test, device,
+    sigmas=(0.00, 0.01, 0.02, 0.05, 0.10),
+    n_noise_seeds: int = 20,
+    batch_size: int = 64,
+    base_seed: int = 0,
+    verbose: bool = True,
+):
+    """
+    For each sigma in ``sigmas``, evaluate the already-trained ensemble on
+    ``X_testf`` perturbed by ``N(0, sigma**2)`` over ``n_noise_seeds``
+    independent noise realisations. Returns ``{sigma: {metric: (mean, std)}}``.
+
+    Cost: ``len(sigmas) * n_noise_seeds`` forward passes through the
+    ensemble. Training is NOT repeated; this is fast.
+    """
+    results = {}
+    if verbose:
+        print("=" * 70)
+        print("  EXPERIMENT 1: Inference-time noise sensitivity")
+        print(f"  sigma values : {list(sigmas)}")
+        print(f"  noise seeds  : {n_noise_seeds}")
+        print("=" * 70)
+
+    for sigma in sigmas:
+        mets = evaluate_ensemble_with_noise(
+            ensemble_models, X_testf, y_test, sigma,
+            device, n_noise_seeds, batch_size, base_seed,
+        )
+        results[sigma] = mets
+        if verbose:
+            print(f"  sigma={sigma:.2f}  "
+                  f"RMSE={mets['RMSE'][0]:.3f}+/-{mets['RMSE'][1]:.3f}  "
+                  f"MAE={mets['MAE'][0]:.3f}+/-{mets['MAE'][1]:.3f}  "
+                  f"R2={mets['R2'][0]:.3f}+/-{mets['R2'][1]:.3f}  "
+                  f"NASA={mets['NASA'][0]:.1f}+/-{mets['NASA'][1]:.1f}")
+    return results
+
+
+# -------------------------------------------------------------------------
+# Experiment 2: Training-set sub-sampling
+# -------------------------------------------------------------------------
+def run_training_size_sweep(
+    X_train_sw, y_train_sw, X_testf, y_test,
+    features, eng_type, device,
+    fractions=(0.25, 0.50, 0.75, 1.00),
+    n_seeds: int = 3,
+    base_seed: int = 0,
+    X=None, X_test=None,
+    create_training_sequences_sw=None,
+    create_testing_sequences_sw=None,
+    num_of_batches: int = 1,
+    window_size: int = 40,
+    run_ensemble: bool = True,
+    verbose: bool = True,
+):
+    """
+    For each fraction ``f`` in ``fractions``, sub-sample the training set to
+    a random permutation of size ``int(N * f)``, then call
+    ``run_all_scenarios`` with the sub-sampled data. Repeat for ``n_seeds``
+    shuffle seeds and report mean +/- std of the best leaderboard entry
+    (typically Scenario E ensemble).
+
+    Returns: ``{fraction: {metric: (mean, std)}}``.
+
+    Cost: ``len(fractions) * n_seeds`` full scenario sweeps. This is the
+    most expensive experiment. Set ``run_ensemble=False`` to skip Scenario E
+    for faster iteration.
+    """
+    if verbose:
+        print("=" * 70)
+        print("  EXPERIMENT 2: Training-set sub-sampling")
+        print(f"  fractions  : {list(fractions)}")
+        print(f"  n_seeds    : {n_seeds}")
+        print("=" * 70)
+
+    results = {}
+    N_full = len(X_train_sw)
+
+    for frac in fractions:
+        n_take = max(1, int(N_full * frac))
+        seed_metrics = {"RMSE": [], "MAE": [], "R2": [], "NASA": []}
+        for s in range(n_seeds):
+            seed = base_seed + s
+            rng = np.random.default_rng(seed)
+            perm = rng.permutation(N_full)[:n_take]
+            X_sub = X_train_sw[perm]
+            y_sub = y_train_sw[perm]
+            if verbose:
+                print(f"\n  [frac={frac:.2f}  seed={seed}  n_train={n_take}]")
+            try:
+                lb = run_all_scenarios(
+                    X_train_sw=X_sub, y_train_sw=y_sub,
+                    X_testf=X_testf, y_test=y_test,
+                    features=features, eng_type=eng_type, device=device,
+                    X=X, X_test=X_test,
+                    create_training_sequences_sw=create_training_sequences_sw,
+                    create_testing_sequences_sw=create_testing_sequences_sw,
+                    num_of_batches=num_of_batches,
+                    window_size=window_size,
+                    random_state=seed,
+                    run_ensemble=run_ensemble,
+                    verbose=False,
+                )
+            except Exception as e:
+                print(f"    !! run_all_scenarios failed: {e}")
+                continue
+            best = lb[0]  # already sorted by RMSE ascending
+            seed_metrics["RMSE"].append(best["RMSE"])
+            seed_metrics["MAE"].append(best["MAE"])
+            seed_metrics["R2"].append(best["R2"])
+            seed_metrics["NASA"].append(best["NASA"])
+            if verbose:
+                print(f"    best scenario {best['scenario']}: "
+                      f"RMSE={best['RMSE']:.3f}  NASA={best['NASA']:.1f}")
+
+        def _ms(lst):
+            if not lst:
+                return (float("nan"), float("nan"))
+            return (float(np.mean(lst)), float(np.std(lst)))
+        results[frac] = {k: _ms(v) for k, v in seed_metrics.items()}
+        if verbose:
+            r = results[frac]
+            print(f"\n  [SUMMARY frac={frac:.2f}]  "
+                  f"RMSE={r['RMSE'][0]:.3f}+/-{r['RMSE'][1]:.3f}  "
+                  f"MAE={r['MAE'][0]:.3f}+/-{r['MAE'][1]:.3f}  "
+                  f"R2={r['R2'][0]:.3f}+/-{r['R2'][1]:.3f}  "
+                  f"NASA={r['NASA'][0]:.1f}+/-{r['NASA'][1]:.1f}")
+    return results
+
+
+# -------------------------------------------------------------------------
+# Experiment 3: Dropout-rate sweep
+# -------------------------------------------------------------------------
+def run_dropout_sweep(
+    X_train_sw, y_train_sw, X_testf, y_test,
+    features, eng_type, device,
+    base_scenario_config_fn=None,    # defaults to scenario_D_config
+    base_window: int = 50,
+    dropouts=(0.00, 0.05, 0.10, 0.20, 0.30),
+    n_seeds: int = 3,
+    base_seed: int = 0,
+    X=None, X_test=None,
+    create_training_sequences_sw=None,
+    create_testing_sequences_sw=None,
+    num_of_batches: int = 1,
+    verbose: bool = True,
+):
+    """
+    For each dropout rate ``p`` in ``dropouts``, override
+    ``dropout_t``, ``dropout_c``, and ``head_dropout`` of the base scenario
+    config to ``p`` and train ``n_seeds`` models. Report mean +/- std of
+    test RMSE, MAE, R2, NASA.
+
+    Re-windowed sequences are required only if ``base_window`` differs from
+    ``X_train_sw.shape[1]`` (Scenario D's default window is 50; the data-prep
+    cells use 40, so re-windowing is normally needed).
+    """
+    if base_scenario_config_fn is None:
+        base_scenario_config_fn = scenario_D_config
+
+    if verbose:
+        print("=" * 70)
+        print("  EXPERIMENT 3: Dropout-rate sweep")
+        print(f"  dropouts : {list(dropouts)}")
+        print(f"  n_seeds  : {n_seeds}")
+        print(f"  base cfg : {base_scenario_config_fn.__name__}")
+        print("=" * 70)
+
+    # Prepare data at the right window size
+    if base_window == X_train_sw.shape[1]:
+        Xsw, ysw, Xtf = X_train_sw, y_train_sw, X_testf
+    else:
+        if any(v is None for v in (X, X_test,
+                                   create_training_sequences_sw,
+                                   create_testing_sequences_sw)):
+            raise ValueError(
+                f"base_window={base_window} differs from the window used to "
+                f"build X_train_sw (shape[1]={X_train_sw.shape[1]}). Pass "
+                f"X, X_test, create_training_sequences_sw, and "
+                f"create_testing_sequences_sw so we can re-window."
+            )
+        print(f"  [re-windowing data for base_window={base_window} ...]")
+        Xsw, ysw = create_training_sequences_sw(X, features, base_window)
+        Xtf = create_testing_sequences_sw(
+            X_test, features, base_window, num_of_batches=num_of_batches
+        )
+
+    test_loader = _build_sensitivity_test_loader(Xtf, y_test, batch_size=64)
+
+    results = {}
+    for p in dropouts:
+        seed_metrics = {"RMSE": [], "MAE": [], "R2": [], "NASA": []}
+        for s in range(n_seeds):
+            seed = base_seed + s
+            torch.manual_seed(seed)
+            np.random.seed(seed)
+
+            X_tr, X_val, y_tr, y_val = train_test_split(
+                Xsw, ysw, test_size=0.2, random_state=seed
+            )
+            cfg = base_scenario_config_fn(features, base_window)
+            cfg.dropout_t = float(p)
+            cfg.dropout_c = float(p)
+            cfg.head_dropout = float(p)
+            tr_ld, vl_ld, (C, L) = make_loaders_augmented(
+                X_tr, X_val, y_tr, y_val,
+                batch_size=cfg.batch_size,
+                num_workers=getattr(cfg, "num_workers", 0),
+                noise_std=0.02,   # match Scenario D's augmentation
+                use_cuda=str(device).startswith("cuda"),
+            )
+            cfg.C = C
+            cfg.L = L
+
+            if verbose:
+                print(f"\n  [dropout={p:.2f}  seed={seed}  C={C} L={L}]")
+            model, _, _ = fit_improved(
+                tr_ld, vl_ld, features, cfg, device,
+                loss_fn=AsymmetricHuberLoss(delta=10.0,
+                                            alpha_late=1.3, alpha_early=1.0),
+                use_scheduler=True, scheduler_type="cosine_warm",
+                accumulation_steps=1, verbose=False,
+            )
+            _, mets, ytrue, ypred = evaluate_improved(
+                model, test_loader, device, nn.MSELoss()
+            )
+            nasa = score_nasa(ypred - ytrue)
+            seed_metrics["RMSE"].append(mets["RMSE"])
+            seed_metrics["MAE"].append(mets["MAE"])
+            seed_metrics["R2"].append(mets["R2"])
+            seed_metrics["NASA"].append(nasa)
+            if verbose:
+                print(f"    RMSE={mets['RMSE']:.3f}  "
+                      f"MAE={mets['MAE']:.3f}  "
+                      f"R2={mets['R2']:.3f}  "
+                      f"NASA={nasa:.1f}")
+
+        def _ms(lst):
+            if not lst:
+                return (float("nan"), float("nan"))
+            return (float(np.mean(lst)), float(np.std(lst)))
+        results[p] = {k: _ms(v) for k, v in seed_metrics.items()}
+        if verbose:
+            r = results[p]
+            print(f"\n  [SUMMARY dropout={p:.2f}]  "
+                  f"RMSE={r['RMSE'][0]:.3f}+/-{r['RMSE'][1]:.3f}  "
+                  f"MAE={r['MAE'][0]:.3f}+/-{r['MAE'][1]:.3f}  "
+                  f"R2={r['R2'][0]:.3f}+/-{r['R2'][1]:.3f}  "
+                  f"NASA={r['NASA'][0]:.1f}+/-{r['NASA'][1]:.1f}")
+    return results
+
+
+# -------------------------------------------------------------------------
+# Experiment 4: Cross-engine evaluation
+# -------------------------------------------------------------------------
+@torch.no_grad()
+def run_cross_engine_evaluation(
+    checkpoint_path: str,
+    cfg,                            # TrainConfig used at training time
+    X_test_target,                  # X_testf-style array for the target engine
+    y_test_target,
+    device,
+    label: str = "transfer",
+    batch_size: int = 64,
+    verbose: bool = True,
+):
+    """
+    Load a checkpoint that was trained on the source engine and evaluate it
+    on the target engine's test set.
+
+    The caller MUST preprocess ``X_test_target`` with the SAME feature
+    ordering and normalisation pipeline used when training the source model
+    (e.g.\\ for FD001 -> FD003 transfer, the FD003 test set must use the
+    same constant-sensor filter and StandardScaler stats as FD001).
+
+    Raises ``ValueError`` if the channel count of ``X_test_target`` does not
+    match ``cfg.C`` -- feature alignment is required first.
+    """
+    arr = np.asarray(X_test_target)
+    if arr.ndim != 3:
+        raise ValueError(f"Expected 3-D X_test_target, got shape {arr.shape}")
+    if arr.shape[1] >= arr.shape[2]:
+        Xt = arr.transpose(0, 2, 1)
+    else:
+        Xt = arr
+    C_target = Xt.shape[1]
+    L_target = Xt.shape[2]
+    if C_target != cfg.C:
+        raise ValueError(
+            f"Channel count mismatch: checkpoint was trained with C={cfg.C} "
+            f"but X_test_target has C={C_target}. Align the feature set "
+            f"(constant-sensor filter, cluster normalisation) of the target "
+            f"engine to the source engine before calling this."
+        )
+    if L_target != cfg.L:
+        raise ValueError(
+            f"Window-length mismatch: checkpoint was trained with L={cfg.L} "
+            f"but X_test_target has L={L_target}. Re-window the target "
+            f"X_test with the same window size used for source training."
+        )
+
+    model = PatchTST_RUL_Model(
+        C=cfg.C, L=cfg.L,
+        d_model_t=cfg.d_model_t, n_heads_t=cfg.n_heads_t,
+        n_layers_t=cfg.n_layers_t, d_ff_t=cfg.d_ff_t,
+        dropout_t=cfg.dropout_t,
+        patch_len_t=cfg.patch_len_t, stride_t=cfg.stride_t,
+        patch_len_c=cfg.patch_len_c, stride_c=cfg.stride_c,
+        d_model_c=cfg.d_model_c, n_heads_c=cfg.n_heads_c,
+        n_layers_c=cfg.n_layers_c, d_ff_c=cfg.d_ff_c,
+        dropout_c=cfg.dropout_c,
+        head_hidden=cfg.head_hidden,
+        pooling="mean",
+        use_bn_temporal=True,
+        use_bn_channel=True,
+    ).to(device)
+    state = torch.load(checkpoint_path, map_location=device)
+    model.load_state_dict(state, strict=True)
+    model.eval()
+
+    loader = _build_sensitivity_test_loader(Xt, y_test_target, batch_size=batch_size)
+    _, mets, ytrue, ypred = evaluate_improved(
+        model, loader, device, nn.MSELoss()
+    )
+    nasa = score_nasa(ypred - ytrue)
+    out = {
+        "label": label,
+        "RMSE": mets["RMSE"], "MAE": mets["MAE"],
+        "R2":   mets["R2"],   "NASA": nasa,
+    }
+    if verbose:
+        print("=" * 70)
+        print(f"  EXPERIMENT 4: Cross-engine evaluation [{label}]")
+        print("=" * 70)
+        print(f"  RMSE={mets['RMSE']:.3f}  MAE={mets['MAE']:.3f}  "
+              f"R2={mets['R2']:.3f}  NASA={nasa:.1f}")
+    return out
+
+
+# -------------------------------------------------------------------------
+# Top-level orchestrator: run all four experiments
+# -------------------------------------------------------------------------
+def run_all_sensitivity_experiments(
+    # Required for ALL four experiments
+    X_train_sw, y_train_sw, X_testf, y_test,
+    features, eng_type, device,
+    # Pass-through for run_all_scenarios re-windowing
+    X=None, X_test=None,
+    create_training_sequences_sw=None,
+    create_testing_sequences_sw=None,
+    num_of_batches: int = 1,
+    window_size: int = 40,
+
+    # Experiment toggles
+    do_noise: bool = True,
+    do_size: bool = True,
+    do_dropout: bool = True,
+    do_cross: bool = False,
+
+    # Per-experiment parameters
+    noise_sigmas=(0.00, 0.01, 0.02, 0.05, 0.10),
+    noise_seeds: int = 20,
+    size_fractions=(0.25, 0.50, 0.75, 1.00),
+    size_seeds: int = 3,
+    dropout_values=(0.00, 0.05, 0.10, 0.20, 0.30),
+    dropout_seeds: int = 3,
+
+    # Cross-engine parameters (required if do_cross=True)
+    cross_checkpoint_path=None,
+    cross_cfg=None,
+    cross_X_test_target=None,
+    cross_y_test_target=None,
+    cross_label: str = "transfer",
+
+    base_seed: int = 0,
+    verbose: bool = True,
+):
+    """
+    Run the four sensitivity experiments in sequence. Each can be toggled
+    off via its ``do_*`` flag.
+
+    Returns ``{'noise': ..., 'size': ..., 'dropout': ..., 'cross': ...}``
+    populated only for the experiments that were run.
+    """
+    print("=" * 70)
+    print("  SENSITIVITY & ROBUSTNESS EXPERIMENT SUITE")
+    print(f"  Engine     : {eng_type}")
+    print(f"  do_noise   : {do_noise}    "
+          f"(sigma={list(noise_sigmas)}, seeds={noise_seeds})")
+    print(f"  do_size    : {do_size}     "
+          f"(fractions={list(size_fractions)}, seeds={size_seeds})")
+    print(f"  do_dropout : {do_dropout}  "
+          f"(values={list(dropout_values)}, seeds={dropout_seeds})")
+    print(f"  do_cross   : {do_cross}")
+    print("=" * 70)
+
+    results = {}
+
+    # -------- Train a Scenario E ensemble once (used by the noise sweep) -----
+    base_ensemble = None
+    base_Xtf = X_testf
+    if do_noise:
+        print("\n  [pre-step] Training Scenario E ensemble on full training "
+              "set to drive the noise sweep ...")
+        lb = run_all_scenarios(
+            X_train_sw=X_train_sw, y_train_sw=y_train_sw,
+            X_testf=X_testf, y_test=y_test,
+            features=features, eng_type=eng_type, device=device,
+            X=X, X_test=X_test,
+            create_training_sequences_sw=create_training_sequences_sw,
+            create_testing_sequences_sw=create_testing_sequences_sw,
+            num_of_batches=num_of_batches,
+            window_size=window_size,
+            random_state=base_seed + 341,
+            run_ensemble=True,
+            verbose=False,
+        )
+        best = next((r for r in lb if str(r["scenario"]).startswith("E")), lb[0])
+        if isinstance(best["model"], list):
+            base_ensemble = best["model"]
+        else:
+            base_ensemble = [best["model"]]
+        # Re-window X_testf if the best scenario used a larger window
+        if best["window"] != window_size:
+            if create_testing_sequences_sw is None or X_test is None:
+                print("    [warn] best scenario used a larger window but "
+                      "X_test / create_testing_sequences_sw not supplied; "
+                      "using the original X_testf (may shape-mismatch).")
+            else:
+                print(f"    [pre-step] Re-windowing X_testf to "
+                      f"window={best['window']} for the noise sweep ...")
+                base_Xtf = create_testing_sequences_sw(
+                    X_test, features, best["window"],
+                    num_of_batches=num_of_batches,
+                )
+
+    # -------- Experiment 1: noise sweep --------------------------------------
+    if do_noise:
+        results["noise"] = run_inference_noise_sweep(
+            base_ensemble, base_Xtf, y_test, device,
+            sigmas=noise_sigmas, n_noise_seeds=noise_seeds,
+            base_seed=base_seed, verbose=verbose,
+        )
+
+    # -------- Experiment 2: training-size sweep ------------------------------
+    if do_size:
+        results["size"] = run_training_size_sweep(
+            X_train_sw, y_train_sw, X_testf, y_test,
+            features, eng_type, device,
+            fractions=size_fractions, n_seeds=size_seeds, base_seed=base_seed,
+            X=X, X_test=X_test,
+            create_training_sequences_sw=create_training_sequences_sw,
+            create_testing_sequences_sw=create_testing_sequences_sw,
+            num_of_batches=num_of_batches, window_size=window_size,
+            run_ensemble=True, verbose=verbose,
+        )
+
+    # -------- Experiment 3: dropout sweep ------------------------------------
+    if do_dropout:
+        results["dropout"] = run_dropout_sweep(
+            X_train_sw, y_train_sw, X_testf, y_test,
+            features, eng_type, device,
+            base_scenario_config_fn=scenario_D_config, base_window=50,
+            dropouts=dropout_values, n_seeds=dropout_seeds, base_seed=base_seed,
+            X=X, X_test=X_test,
+            create_training_sequences_sw=create_training_sequences_sw,
+            create_testing_sequences_sw=create_testing_sequences_sw,
+            num_of_batches=num_of_batches, verbose=verbose,
+        )
+
+    # -------- Experiment 4: cross-engine -------------------------------------
+    if do_cross:
+        missing = [n for n, v in [
+            ("cross_checkpoint_path", cross_checkpoint_path),
+            ("cross_cfg",             cross_cfg),
+            ("cross_X_test_target",   cross_X_test_target),
+            ("cross_y_test_target",   cross_y_test_target),
+        ] if v is None]
+        if missing:
+            raise ValueError(
+                "do_cross=True requires the following arguments: "
+                + ", ".join(missing)
+            )
+        results["cross"] = run_cross_engine_evaluation(
+            cross_checkpoint_path, cross_cfg,
+            cross_X_test_target, cross_y_test_target,
+            device, label=cross_label, verbose=verbose,
+        )
+
+    # -------- Pretty-print summary ------------------------------------------
+    print("\n" + "=" * 70)
+    print("  SENSITIVITY EXPERIMENT SUMMARY")
+    print("=" * 70)
+    for name, body in results.items():
+        print(f"\n  --- {name} ---")
+        if name == "cross":
+            for k, v in body.items():
+                if k != "label":
+                    print(f"    {k}: {v}")
+        else:
+            for k, v in body.items():
+                pieces = []
+                for m in ("RMSE", "MAE", "R2", "NASA"):
+                    if m in v:
+                        pieces.append(f"{m}={v[m][0]:.3f}+/-{v[m][1]:.3f}")
+                print(f"    {k}: {'  '.join(pieces)}")
+    return results
+
+
+# =============================================================================
+#  USAGE EXAMPLE
+# =============================================================================
+#
+# After running the standard data-prep cells of
+# MainSingleEng_FD001_F2_FD003_F4_Final.py (which produce
+#   X_train_sw, y_train_sw, X_testf, y_test, features, eng_type,
+#   X, X_test, create_training_sequences_sw, create_testing_sequences_sw,
+#   num_of_batches, window_size, device
+# ), invoke:
+#
+#   from improve_transformer_sensitivity_analysis import (
+#       run_all_sensitivity_experiments,
+#   )
+#
+#   results = run_all_sensitivity_experiments(
+#       X_train_sw=X_train_sw, y_train_sw=y_train_sw,
+#       X_testf=X_testf,       y_test=y_test,
+#       features=features,     eng_type=eng_type,    device=device,
+#       X=X, X_test=X_test,
+#       create_training_sequences_sw=create_training_sequences_sw,
+#       create_testing_sequences_sw=create_testing_sequences_sw,
+#       num_of_batches=num_of_batches, window_size=window_size,
+#       do_noise=True, do_size=True, do_dropout=True, do_cross=False,
+#       noise_seeds=20, size_seeds=3, dropout_seeds=3,
+#   )
+#
+# For cross-engine evaluation, FIRST train on FD001 (saving the best
+# checkpoint, e.g. scenarioD_FD001_final.pt produced by run_all_scenarios),
+# THEN re-run the data-prep cells with eng_type='FD003' to get FD003's
+# X_testf and y_test, and call:
+#
+#   from improve_transformer_sensitivity_analysis import (
+#       run_cross_engine_evaluation, scenario_D_config,
+#   )
+#
+#   cfg_src = scenario_D_config(features_src, 50)   # MUST match source training
+#   result = run_cross_engine_evaluation(
+#       checkpoint_path='scenarioD_FD001_final.pt',
+#       cfg=cfg_src,
+#       X_test_target=X_testf,        # the new FD003 X_testf
+#       y_test_target=y_test,         # the new FD003 y_test
+#       device=device,
+#       label='FD001 -> FD003',
+#   )
+#
+# Notes
+# -----
+# 1. The 20-seed protocol claimed in access_R1.tex is fully supported (set
+#    noise_seeds=20, size_seeds=20, dropout_seeds=20). Defaults are smaller
+#    (3 for size and dropout) to keep wall-clock manageable on first run.
+# 2. For cross-engine evaluation, the SOURCE and TARGET engines must share
+#    the same constant-sensor set so the feature count matches; this is the
+#    case for FD001 <-> FD003 but NOT for FD001 <-> FD002 (different op
+#    regimes lead to different post-cluster feature sets).
+# 3. None of these wrappers modify ``improve_transformer.py``; this file is
+#    a copy plus this Section 8 appended at the bottom.
 # ─────────────────────────────────────────────────────────────────────────────

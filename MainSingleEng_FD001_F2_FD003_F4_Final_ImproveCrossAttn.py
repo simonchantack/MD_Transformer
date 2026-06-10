@@ -75,7 +75,7 @@ Sensor_dictionary
 # Load Test Data
 # this is RUL of each engine on test set. 100 row 
 import pandas as pd
-eng_type = 'FD001'
+eng_type = 'FD002'
 data_test = pd.read_csv('Data/test_' + eng_type +'.txt' , sep = ' ' , 
                        header = None, names = column_names , index_col = False)
 
@@ -600,7 +600,233 @@ leaderboard = run_crossattn_scenarios(
 )
 
 
+# %%
+# # %%
+# import torch
+# import numpy as np
+# import torch.nn as nn
+# from improve_transformer import (
+#     scenario_A_config, scenario_B_config,
+#     scenario_C_config, scenario_D_config,
+#     evaluate_improved, ensemble_predict, score_nasa,
+# )
+# from patchtst_crossattn import (
+#     PatchTST_CrossAttn_Model,
+#     CrossAttentionFusionHead,
+# )
 
+# # =============================================================================
+# #  STEP 1 — Load checkpoint and detect type
+# # =============================================================================
+
+# model_path = f"BEST_crossattn_{eng_type}.pt"
+# checkpoint = torch.load(model_path, map_location=device)
+
+# is_ensemble = isinstance(checkpoint, dict) and "ensemble" in checkpoint
+
+# print(f"Checkpoint type : {'ENSEMBLE' if is_ensemble else 'SINGLE MODEL'}")
+# if is_ensemble:
+#     print(f"  Members        : {len(checkpoint['ensemble'])}")
+#     print(f"  Best scenario  : {checkpoint.get('scenario', 'unknown')}")
+#     print(f"  Fusion type    : {checkpoint.get('fusion', 'cross_attention')}")
+
+# # =============================================================================
+# #  STEP 2 — Auto-detect architecture from weights
+# #  The .pt file only stores weights, not the config, so we read the
+# #  hyperparameters directly from tensor shapes — no guessing required.
+# # =============================================================================
+
+# def detect_arch_from_state_dict(sd: dict) -> dict:
+#     """
+#     Infer PatchTST_CrossAttn_Model hyperparameters from tensor shapes.
+#     Works identically for single-model and each member of an ensemble.
+#     """
+#     arch = {}
+
+#     # ── Encoder dimensions ────────────────────────────────────────────────
+#     arch["d_model_t"]   = sd["temporal_encoder.patch_embed.proj.bias"].shape[0]
+#     arch["d_model_c"]   = sd["sensor_encoder.patch_embed.proj.bias"].shape[0]
+#     arch["patch_len_t"] = sd["temporal_encoder.patch_embed.proj.weight"].shape[1]
+#     arch["patch_len_c"] = sd["sensor_encoder.patch_embed.proj.weight"].shape[1]
+#     arch["d_ff_t"]      = sd["temporal_encoder.encoder.layers.0.linear1.bias"].shape[0]
+#     arch["d_ff_c"]      = sd["sensor_encoder.transformer_encoder.layers.0.linear1.bias"].shape[0]
+
+#     # Count encoder layers
+#     t_layers = {int(k.split(".")[3]) for k in sd if k.startswith("temporal_encoder.encoder.layers.")}
+#     c_layers = {int(k.split(".")[3]) for k in sd if k.startswith("sensor_encoder.transformer_encoder.layers.")}
+#     arch["n_layers_t"]  = max(t_layers) + 1
+#     arch["n_layers_c"]  = max(c_layers) + 1
+#     arch["n_heads_t"]   = 8    # fixed in all your configs
+#     arch["n_heads_c"]   = 8
+
+#     # ── Cross-attention fusion dimensions ─────────────────────────────────
+#     # q_proj inside t_to_c block: shape is (d_model_xattn, d_model_t)
+#     arch["d_model_xattn"] = sd["fusion_head.t_to_c.q_proj.weight"].shape[0]
+#     arch["n_heads_xattn"] = arch["n_heads_t"]   # always matched in all configs
+
+#     # FFN inside cross-attn block (if present)
+#     ffn_key = "fusion_head.t_to_c.ffn.0.weight"
+#     arch["d_ff_xattn"] = sd[ffn_key].shape[0] if ffn_key in sd else 0
+
+#     # MLP head: first linear after LayerNorm in fusion_head.mlp
+#     # mlp structure: LayerNorm(2*d_xattn) → Linear → GELU → Dropout → Linear(→1)
+#     arch["head_hidden"] = sd["fusion_head.mlp.1.bias"].shape[0]
+
+#     # Stride: not stored in weights — use half of patch_len (your convention)
+#     arch["stride_t"]  = arch["patch_len_t"] // 2
+#     arch["stride_c"]  = 1
+
+#     # Dropout: not stored — use 0.0 at inference (no effect on predictions)
+#     arch["dropout_t"]     = 0.0
+#     arch["dropout_c"]     = 0.0
+#     arch["dropout_xattn"] = 0.0
+
+#     return arch
+
+
+# first_sd = checkpoint["ensemble"][0] if is_ensemble else checkpoint
+# arch     = detect_arch_from_state_dict(first_sd)
+
+# print("\nDetected architecture:")
+# for k, v in arch.items():
+#     print(f"  {k:<20} : {v}")
+
+# # =============================================================================
+# #  STEP 3 — Reconstruct the correct scenario config (C and L)
+# #
+# #  C (channels) comes from len(features) — always known from your notebook.
+# #  L (window) cannot be read from weights but can be inferred from the
+# #  scenario: A and B use the original window_size; C and D use max(window_size,50).
+# #  We detect the winning scenario from the checkpoint filename/key, then
+# #  reconstruct the matching config so C and L are correct.
+# # =============================================================================
+
+# # Read winning scenario label from checkpoint metadata if available
+# if is_ensemble:
+#     winning_scenario = checkpoint.get("scenario", "E (ensemble)")
+#     # E ensemble was built from the best single scenario — strip suffix
+#     # e.g. "E (ensemble)" → the underlying config is the best A/B/C/D
+#     # We stored the base label in the leaderboard; reconstruct from arch:
+#     # if n_layers==3 and d_model==96 → Scenario B or D
+#     # if n_layers==2 and d_model==64 → Scenario A or C
+#     # Distinguish A vs B by window (50 means C or D)
+#     print(f"\nWinning scenario from checkpoint: {winning_scenario}")
+# else:
+#     winning_scenario = "unknown"
+#     print("\nSingle model — inferring scenario from architecture shapes.")
+
+# # Infer the scenario from the detected architecture
+# LARGER_W = max(window_size, 50)
+
+# if arch["d_model_t"] == 96 and arch["n_layers_t"] == 3:
+#     # Scenario B (original window) or D (larger window)
+#     # Distinguish by whether L == window_size or LARGER_W
+#     inferred_scenario = "D" if LARGER_W != window_size else "B"
+# else:
+#     # Scenario A (original window) or C (larger window)
+#     inferred_scenario = "C" if LARGER_W != window_size else "A"
+
+# print(f"Inferred base scenario : {inferred_scenario}")
+
+# # Build the config for the inferred scenario
+# _config_map = {
+#     "A": lambda: scenario_A_config(features, window_size),
+#     "B": lambda: scenario_B_config(features, window_size),
+#     "C": lambda: scenario_C_config(features, LARGER_W),
+#     "D": lambda: scenario_D_config(features, LARGER_W),
+# }
+# cfg = _config_map[inferred_scenario]()
+
+# # Set C and L — C from features (always correct), L from window used
+# cfg.C = len(features)
+# cfg.L = window_size if inferred_scenario in ("A", "B") else LARGER_W
+
+# print(f"\nReconstructed cfg:")
+# print(f"  C (channels) : {cfg.C}")
+# print(f"  L (window)   : {cfg.L}")
+# print(f"  d_model_t    : {cfg.d_model_t}")
+# print(f"  n_layers_t   : {cfg.n_layers_t}")
+# print(f"  d_ff_t       : {cfg.d_ff_t}")
+
+# # =============================================================================
+# #  STEP 4 — Build model(s) and load weights
+# # =============================================================================
+
+# def build_crossattn_model(arch: dict, cfg, device) -> nn.Module:
+#     """Construct PatchTST_CrossAttn_Model from detected arch + cfg."""
+#     m = PatchTST_CrossAttn_Model(
+#         C              = cfg.C,
+#         L              = cfg.L,
+#         d_model_t      = arch["d_model_t"],
+#         n_heads_t      = arch["n_heads_t"],
+#         n_layers_t     = arch["n_layers_t"],
+#         d_ff_t         = arch["d_ff_t"],
+#         dropout_t      = arch["dropout_t"],
+#         patch_len_t    = arch["patch_len_t"],
+#         stride_t       = arch["stride_t"],
+#         patch_len_c    = arch["patch_len_c"],
+#         stride_c       = arch["stride_c"],
+#         d_model_c      = arch["d_model_c"],
+#         n_heads_c      = arch["n_heads_c"],
+#         n_layers_c     = arch["n_layers_c"],
+#         d_ff_c         = arch["d_ff_c"],
+#         dropout_c      = arch["dropout_c"],
+#         head_hidden    = arch["head_hidden"],
+#         d_model_xattn  = arch["d_model_xattn"],
+#         n_heads_xattn  = arch["n_heads_xattn"],
+#         d_ff_xattn     = arch["d_ff_xattn"],
+#         dropout_xattn  = arch["dropout_xattn"],
+#         use_bn_temporal= True,
+#         use_bn_channel = True,
+#     ).to(device)
+#     return m
+
+
+# if is_ensemble:
+#     loaded_models = []
+#     for i, sd in enumerate(checkpoint["ensemble"]):
+#         m = build_crossattn_model(arch, cfg, device)
+#         m.load_state_dict(sd)
+#         m.eval()
+#         loaded_models.append(m)
+#         print(f"  Ensemble member {i+1} loaded ✔")
+#     print(f"\nEnsemble of {len(loaded_models)} models ready for inference.")
+# else:
+#     loaded_model = build_crossattn_model(arch, cfg, device)
+#     loaded_model.load_state_dict(checkpoint)
+#     loaded_model.eval()
+#     print("Model loaded and set to eval mode ✔")
+
+# # =============================================================================
+# #  STEP 5 — Rebuild test loader and run inference
+# # =============================================================================
+# from MainSingleEng_FD001_F2_FD003_F4_Final import make_test_loader
+# test_dataloader = make_test_loader(
+#     X_testf     = X_testf,
+#     y_test      = y_test,
+#     batch_size  = 64,
+#     num_workers = 0,
+#     use_cuda    = torch.cuda.is_available(),
+# )
+
+# criterion = nn.MSELoss()
+
+# if is_ensemble:
+#     y_pred_final, y_true_final, final_mets = ensemble_predict(
+#         loaded_models, test_dataloader, device
+#     )
+# else:
+#     _, final_mets, y_true_final, y_pred_final = evaluate_improved(
+#         loaded_model, test_dataloader, device, criterion
+#     )
+
+# nasa = score_nasa(y_pred_final - y_true_final)
+
+# print(f"\n── Final Evaluation ({'Ensemble' if is_ensemble else 'Single'}) ──")
+# print(f"  RMSE  : {final_mets['RMSE']:.4f}")
+# print(f"  MAE   : {final_mets['MAE']:.4f}")
+# print(f"  R²    : {final_mets['R2']:.4f}")
+# print(f"  NASA  : {nasa:.2f}")
 # %%
 
 import torch
@@ -880,9 +1106,9 @@ plt.show()
 
 # %%
 # =============================================================================
-#  HOW TO CALL ENCODER FUSION EXPERIMENT 
+#  HOW TO CALL FROM YOUR TRAINING NOTEBOOK
 # =============================================================================
-# Black background
+
 from encoder_fusion_experiment import run_fusion_experiment
 
 
@@ -904,13 +1130,12 @@ else:
 fig
 
 # %%
-# White background
 from encoder_fusion_experiment_whitebackground import run_fusion_experiment
 
 
 if is_ensemble:
     fig, embs, ablation = run_fusion_experiment(
-        model            = loaded_models[0],
+        model            = loaded_models[1],
         test_dataloader  = test_dataloader,
         device           = device,
         save_path        = "fusion_experiment_results.png",

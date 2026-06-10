@@ -1153,6 +1153,7 @@ def run_rope_scenarios(
         )
 
         ensemble_models = []
+        per_seed_rows   = []          # NEW: capture per-seed test metrics
         for seed in [42, 137, 271]:
             print(f"\n  [Ensemble seed={seed}]")
             torch.manual_seed(seed)
@@ -1183,6 +1184,21 @@ def run_rope_scenarios(
                 rope_base         = rope_base,
             )
             ensemble_models.append(em)
+            # NEW: per-seed test metrics for paired-t-test analysis
+            _, _m, _yt, _yp = evaluate_improved(
+                em, te_loader, device, nn.MSELoss())
+            per_seed_rows.append({
+                "variant": "RoPE", "seed": seed, "eng_type": eng_type,
+                "RMSE": _m["RMSE"], "MAE": _m["MAE"],
+                "R2": _m["R2"],
+                "NASA": float(score_nasa(_yp - _yt)),
+            })
+
+        # NEW: persist per-seed metrics to CSV (one file per variant per engine)
+        import os as _os, pandas as _pd
+        _os.makedirs("per_seed_metrics", exist_ok=True)
+        _pd.DataFrame(per_seed_rows).to_csv(
+            f"per_seed_metrics/RoPE_{eng_type}.csv", index=False)
 
         ens_pred, ens_true, ens_mets = ensemble_predict(
             ensemble_models, te_loader, device
@@ -1256,7 +1272,7 @@ def run_rope_scenarios(
 
 
 # =============================================================================
-#  COPY-PASTE SNIPPET FOR THE NOTEBOOK
+#  COPY-PASTE SNIPPET FOR YOUR NOTEBOOK
 # =============================================================================
 #
 #   from improve_transformer_rope import run_rope_scenarios

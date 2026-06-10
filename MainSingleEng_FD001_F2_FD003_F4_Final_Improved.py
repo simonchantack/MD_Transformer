@@ -911,6 +911,8 @@ class PatchTST_RUL_Model(nn.Module):
 # 'Cross Attention' ; has its own execution file MainSingleEng_FD001_F2_FD003_F4_Final_ImproveCrossAttn.py
 # 'Rotational Positional Encoding' ; 
 # 'BERT'
+# 'Sensitivity Analysis'
+# 'Baseline' ; has its own execution file MainSingleEng_FD001_F2_FD003_F4_Final_Baseline.py
 
 # Set experiment
 experiment_mode = 'Improved Transformer' 
@@ -939,6 +941,26 @@ if (experiment_mode == 'Improved Transformer'):
         run_ensemble                 = True,
         verbose                      = True,
     )
+
+# %%
+# Sensitivity analysis experiments
+experiment_mode = 'Sensitivity Analysis'
+if (experiment_mode == 'Sensitivity Analysis'):
+  from improve_transformer_sensitivity_analysis import (
+      run_all_sensitivity_experiments,
+  )
+
+  results = run_all_sensitivity_experiments(
+      X_train_sw=X_train_sw, y_train_sw=y_train_sw,
+      X_testf=X_testf,       y_test=y_test,
+      features=features,     eng_type=eng_type,    device=device,
+      X=X, X_test=X_test,
+      create_training_sequences_sw=create_training_sequences_sw,
+      create_testing_sequences_sw=create_testing_sequences_sw,
+      num_of_batches=num_of_batches, window_size=window_size,
+      do_noise=True, do_size=True, do_dropout=True, do_cross=False,
+      noise_seeds=20, size_seeds=3, dropout_seeds=3,
+  )
 
 
 # %%
@@ -1007,6 +1029,19 @@ if compare_experiments:
     print("Original  best RMSE:", min(r["RMSE"] for r in lb_orig))
     print("BERT      best RMSE:", min(r["RMSE"] for r in lb_bert))
 
+
+
+# %%
+if (experiment_mode == 'Baseline'):
+    # Form A: explicit function call (recommended)
+    from _train_baseline_3seeds import train_baseline_3seeds
+
+    train_baseline_3seeds(
+        X_train_sw=X_train_sw, y_train_sw=y_train_sw,
+        X_testf=X_testf,       y_test=y_test,
+        features=features,     eng_type=eng_type,
+        device=device,
+    )
 
 # %%
 ##### USE FOR IMPROVED TRANSFORMER EXPERIMENT ########
