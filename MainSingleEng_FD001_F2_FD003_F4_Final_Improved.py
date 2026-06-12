@@ -1,3 +1,45 @@
+# =============================================================================
+#  MainSingleEng_FD001_F2_FD003_F4_Final_Improved.py
+# -----------------------------------------------------------------------------
+#  Improvement-experiment driver for the dual-encoder (temporal + sensor-channel)
+#  PatchTST RUL model on the NASA C-MAPSS turbofan benchmark (FD001-FD004).
+#  This file contains the shared data pipeline + model definitions, and then
+#  dispatches to one improvement experiment selected by `experiment_mode`.
+#
+#  HOW TO RUN
+#  ----------
+#  1. Run from the repo root ("Final Code and Files/") - the script uses
+#     relative paths like Data/train_FD001.txt.
+#  2. Select the engine: edit `eng_type` (one of FD001 / FD002 / FD003 / FD004).
+#  3. Select the experiment: set `experiment_mode` (≈ line 918) to one of the
+#     values in the table below, then run the file top-to-bottom.
+#     Each value gates an `if (experiment_mode == ...)` cell that imports its
+#     module and calls that module's `run_*` entrypoint.
+#
+#  experiment_mode values
+#  ----------------------
+#   'Improved Transformer'           -> improve_transformer.run_all_scenarios
+#       Scenarios A-E: asymmetric Huber loss, OneCycleLR, capacity/window bump,
+#       Gaussian-jitter augmentation, 3-seed ensemble.
+#   'Sensitivity Analysis'           -> improve_transformer_sensitivity_analysis
+#                                        .run_all_sensitivity_experiments
+#       Robustness sweeps: input noise / train-set size / dropout.
+#   'Rotational Positional Encoding' -> improve_transformer_rope.run_rope_scenarios
+#       RoPE replaces sinusoidal positional encoding (applied in attention Q/K).
+#   'BERT'                           -> improve_transformer_bert.run_bert_scenarios
+#       Two-phase training: (1) train encoders, (2) freeze them and train a head
+#       over the concatenation of the top-K transformer layers.
+#   'Baseline'                       -> _train_baseline_3seeds.train_baseline_3seeds
+#       Plain baseline architecture, 3 seeds. Also has its own dedicated file
+#       MainSingleEng_FD001_F2_FD003_F4_Final_Baseline.py.
+#   'Cross Attention'                -> NOT implemented here. See
+#       MainSingleEng_FD001_F2_FD003_F4_Final_ImproveCrossAttn.py.
+#
+#  NOTE: mode-specific "reload checkpoint + display results" cells live further
+#  down the file (≈ L1050 Improved Transformer, L1299 RoPE, L1637 BERT). Run the
+#  cell that matches the experiment you trained.
+# =============================================================================
+
 # %%
 import os
 import math
@@ -944,7 +986,7 @@ if (experiment_mode == 'Improved Transformer'):
 
 # %%
 # Sensitivity analysis experiments
-experiment_mode = 'Sensitivity Analysis'
+# experiment_mode = 'Sensitivity Analysis'
 if (experiment_mode == 'Sensitivity Analysis'):
   from improve_transformer_sensitivity_analysis import (
       run_all_sensitivity_experiments,
